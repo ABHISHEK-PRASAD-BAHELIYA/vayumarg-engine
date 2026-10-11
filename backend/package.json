@@ -1,0 +1,19 @@
+{
+  "name": "vayumarg-backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "test": "node --test",
+    "dev": "node src/local/server.js"
+  },
+  "dependencies": {
+    "h3-js": "^4.1.0"
+  },
+  "devDependencies": {
+    "@aws-sdk/client-dynamodb": "^3.600.0",
+    "@aws-sdk/lib-dynamodb": "^3.600.0",
+    "esbuild": "^0.21.5"
+  }
+}

@@ -1,0 +1,180 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  VayuMarg - scores candidate commute routes against real-time PM2.5 stored in
+  H3 (res 8) hexagonal tiles. Serverless: HTTP API + Lambda (Node 20, arm64) + DynamoDB on-demand + EventBridge cron.
+
+Parameters:
+  OpenAqApiKey:
+    Type: String
+    NoEcho: true
+    Default: ''
+    Description: Free key from explore.openaq.org. Leave empty to run on SIMULATED demo data.
+  Cities:
+    Type: String
+    Default: 'delhi,mumbai,bengaluru'
+    Description: Comma-separated city keys (delhi,mumbai,bengaluru,kolkata,chennai,hyderabad,pune). Fewer cities = fewer writes.
+  IngestSchedule:
+    Type: String
+    Default: 'rate(3 hours)'
+    Description: EventBridge schedule for refreshing air tiles.
+  AllowedOrigin:
+    Type: String
+    Default: '*'
+    Description: CORS origin of the frontend (e.g. https://your-site.example). Use * for hackathon demos only.
+
+Globals:
+  Function:
+    Runtime: nodejs20.x
+    Architectures: [arm64]
+    MemorySize: 256
+    Timeout: 15
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref AirTilesTable
+        NODE_OPTIONS: --enable-source-maps
+
+Resources:
+  AirTilesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: cell
+          AttributeType: S
+      KeySchema:
+        - AttributeName: cell
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      CorsConfiguration:
+        AllowOrigins: [!Ref AllowedOrigin]
+        AllowMethods: [GET, POST, OPTIONS]
+        AllowHeaders: [content-type]
+        MaxAge: 600
+      DefaultRouteSettings:
+        # Cost/abuse guard: caps the public API at 10 req/s steady, 20 burst.
+        ThrottlingRateLimit: 10
+        ThrottlingBurstLimit: 20
+
+  ScoreFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Format: esm
+        Target: es2022
+        Minify: true
+        Sourcemap: true
+        OutExtension: [js=.mjs]
+        External: ['@aws-sdk/*']
+        Banner: [js=import { createRequire } from 'module'; const require = createRequire(import.meta.url);]
+        EntryPoints: [src/handlers/score.js]
+    Properties:
+      CodeUri: backend/
+      Handler: score.handler
+      Description: POST /score - cumulative inhaled dosage per candidate route
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref AirTilesTable
+      Events:
+        Score:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /score
+            Method: POST
+
+  AirFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Format: esm
+        Target: es2022
+        Minify: true
+        Sourcemap: true
+        OutExtension: [js=.mjs]
+        External: ['@aws-sdk/*']
+        Banner: [js=import { createRequire } from 'module'; const require = createRequire(import.meta.url);]
+        EntryPoints: [src/handlers/air.js]
+    Properties:
+      CodeUri: backend/
+      Handler: air.handler
+      Description: GET /air - current PM2.5 at a point (school gate)
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref AirTilesTable
+      Events:
+        Air:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /air
+            Method: GET
+
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Format: esm
+        Target: es2022
+        Minify: true
+        Sourcemap: true
+        OutExtension: [js=.mjs]
+        External: ['@aws-sdk/*']
+        Banner: [js=import { createRequire } from 'module'; const require = createRequire(import.meta.url);]
+        EntryPoints: [src/handlers/ingest.js]
+    Properties:
+      CodeUri: backend/
+      Handler: ingest.handler
+      Description: EventBridge cron - refreshes H3 PM2.5 tiles
+      Timeout: 120
+      MemorySize: 512
+      Environment:
+        Variables:
+          OPENAQ_API_KEY: !Ref OpenAqApiKey
+          CITIES: !Ref Cities
+      Policies:
+        - DynamoDBWritePolicy:
+            TableName: !Ref AirTilesTable
+      Events:
+        Cron:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref IngestSchedule
+            Name: !Sub '${AWS::StackName}-ingest'
+            Description: Refresh air-quality tiles
+
+  # Keep logs inside the CloudWatch free allowance.
+  ScoreLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ScoreFunction}'
+      RetentionInDays: 7
+  AirLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AirFunction}'
+      RetentionInDays: 7
+  IngestLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${IngestFunction}'
+      RetentionInDays: 7
+
+Outputs:
+  ApiUrl:
+    Description: Base URL for the frontend (VITE_API_URL)
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+  IngestFunctionName:
+    Description: Invoke once after deploy to seed tiles immediately
+    Value: !Ref IngestFunction
+  TableName:
+    Value: !Ref AirTilesTable
